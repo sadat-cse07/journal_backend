@@ -62,24 +62,25 @@ class ReviewController extends Controller
     /**
      * Show review details
      */
-    public function show(Request $request, $id)
-    {
-        $review = Review::where('reviewer_id', $request->user()->id)
-            ->with([
-                'reviewRound.paper' => function($q) {
-                    $q->with(['files' => function($q) {
-                        $q->where('file_type', 'manuscript')->latest();
-                    }]);
-                },
-                'files'
-            ])
-            ->findOrFail($id);
+/**
+ * Show review details
+ */
+public function show(Request $request, $id)
+{
+    $review = Review::where('reviewer_id', $request->user()->id)
+        ->with([
+            'reviewRound.paper' => function($q) {
+                $q->with(['files', 'category', 'submitter']);
+            },
+            'files'
+        ])
+        ->findOrFail($id);
 
-        return response()->json([
-            'message' => 'Review details retrieved',
-            'review' => $review,
-        ]);
-    }
+    return response()->json([
+        'message' => 'Review details retrieved',
+        'review' => $review,
+    ]);
+}
 
     /**
      * Accept review invitation
