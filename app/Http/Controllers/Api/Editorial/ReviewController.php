@@ -64,201 +64,203 @@ class ReviewController extends Controller
     /**
      * Show paper details for editorial
      */
-    public function showPaper(Request $request, $id)
-    {
-        $paper = Paper::where('editorial_assigned', $request->user()->id)
-            ->with([
-                'submitter',
-                'authors.user',
-                'category',
-                'files',
-                'reviewRounds' => function($q) {
-                    $q->with(['reviews.reviewer.reviewerProfile', 'editorialDecision.decidedBy']);
-                }
-            ])
-            ->findOrFail($id);
+/**
+ * Show paper details for editorial
+ */
+public function showPaper(Request $request, $id)
+{
+    $paper = Paper::where('editorial_assigned', $request->user()->id)
+        ->with([
+            'submitter',
+            'authors.user',
+            'category',
+            'files',
+            'reviewRounds' => function($q) {
+                $q->with([
+                    'reviews' => function($q) {
+                        $q->with('reviewer');
+                    },
+                    'editorialDecision.decidedBy'
+                ]);
+            }
+        ])
+        ->findOrFail($id);
 
-        return response()->json([
-            'message' => 'Paper details retrieved',
-            'paper' => $paper,
-        ]);
-    }
+    return response()->json([
+        'message' => 'Paper details retrieved',
+        'paper' => $paper,
+    ]);
+}
 
     /**
      * Start new review round
      */
-    public function startReviewRound(Request $request, $paperId)
-    {
-        $paper = Paper::where('editorial_assigned', $request->user()->id)
-            ->findOrFail($paperId);
+public function startReviewRound(Request $request, $paperId)
+{
+    $paper = Paper::where('editorial_assigned', $request->user()->id)
+        ->findOrFail($paperId);
 
-        if (!in_array($paper->status, ['submitted', 'under_review', 'revision_required'])) {
-            return response()->json([
-                'message' => 'Paper is not in a reviewable state',
-            ], 422);
-        }
-
-        try {
-            DB::beginTransaction();
-
-            // Increment round number
-            $roundNumber = $paper->current_round + 1;
-            
-            $reviewRound = ReviewRound::create([
-                'paper_id' => $paper->id,
-                'round_number' => $roundNumber,
-                'status' => 'in_progress',
-                'started_at' => now(),
-                'created_by' => $request->user()->id,
-            ]);
-
-            $paper->update([
-                'current_round' => $roundNumber,
-                'status' => 'under_review',
-            ]);
-
-            ActivityLog::create([
-                'user_id' => $request->user()->id,
-                'paper_id' => $paper->id,
-                'action' => 'review_round_started',
-                'description' => "Review round {$roundNumber} started",
-            ]);
-
-            DB::commit();
-
-            return response()->json([
-                'message' => 'Review round started',
-                'review_round' => $reviewRound,
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'message' => 'Error starting review round',
-                'error' => $e->getMessage(),
-            ], 500);
-        }
+    if (!in_array($paper->status, ['submitted', 'revision_required'])) {
+        return response()->json([
+            'message' => 'Paper is not in a reviewable state. Current status: ' . $paper->status,
+        ], 422);
     }
+
+    // Increment round number
+    $roundNumber = $paper->current_round + 1;
+    
+    $reviewRound = ReviewRound::create([
+        'paper_id' => $paper->id,
+        'round_number' => $roundNumber,
+        'status' => 'in_progress',
+        'started_at' => now(),
+        'created_by' => $request->user()->id,
+    ]);
+
+    $paper->update([
+        'current_round' => $roundNumber,
+        'status' => 'under_review',
+    ]);
+
+    ActivityLog::create([
+        'user_id' => $request->user()->id,
+        'paper_id' => $paper->id,
+        'action' => 'review_round_started',
+        'description' => "Review round {$roundNumber} started",
+    ]);
+
+    return response()->json([
+        'message' => 'Review round started',
+        'review_round' => $reviewRound->load('paper'),
+    ]);
+}
 
     /**
      * Get available reviewers
      */
-    public function availableReviewers(Request $request)
-    {
-        $reviewers = User::role('reviewer')
-            ->whereHas('reviewerProfile', function($q) {
-                $q->where('availability_status', 'available')
-                  ->whereRaw('current_reviews < max_reviews');
-            })
-            ->with('reviewerProfile')
-            ->get()
-            ->map(function($reviewer) {
-                return [
-                    'id' => $reviewer->id,
-                    'name' => $reviewer->full_name,
-                    'email' => $reviewer->email,
-                    'expertise' => $reviewer->reviewerProfile->expertise_keywords ?? [],
-                    'current_reviews' => $reviewer->reviewerProfile->current_reviews ?? 0,
-                    'total_reviews' => $reviewer->reviewerProfile->total_reviews_completed ?? 0,
-                    'rating' => $reviewer->reviewerProfile->average_rating ?? 0,
-                ];
-            });
+/**
+ * Get available reviewers
+ */
+public function availableReviewers(Request $request)
+{
+    $reviewers = User::role('reviewer')
+        ->where('status', 'active')
+        ->whereHas('reviewerProfile', function($q) {
+            $q->where('availability_status', 'available')
+              ->whereRaw('current_reviews < max_reviews');
+        })
+        ->with('reviewerProfile')
+        ->get()
+        ->map(function($reviewer) {
+            return [
+                'id' => $reviewer->id,
+                'name' => $reviewer->full_name,
+                'email' => $reviewer->email,
+                'expertise' => $reviewer->reviewerProfile->expertise_keywords ?? [],
+                'current_reviews' => $reviewer->reviewerProfile->current_reviews ?? 0,
+                'max_reviews' => $reviewer->reviewerProfile->max_reviews ?? 5,
+                'total_reviews' => $reviewer->reviewerProfile->total_reviews_completed ?? 0,
+            ];
+        });
 
-        return response()->json([
-            'message' => 'Available reviewers retrieved',
-            'reviewers' => $reviewers,
-        ]);
-    }
+    return response()->json([
+        'message' => 'Available reviewers retrieved',
+        'reviewers' => $reviewers,
+    ]);
+}
 
     /**
      * Assign reviewers to round
      */
-    public function assignReviewers(Request $request, $roundId)
-    {
-        $request->validate([
-            'reviewer_ids' => 'required|array|min:2',
-            'reviewer_ids.*' => 'required|exists:users,id',
-            'due_date' => 'nullable|date|after:today',
+/**
+ * Assign reviewers to round
+ */
+public function assignReviewers(Request $request, $roundId)
+{
+    $request->validate([
+        'reviewer_ids' => 'required|array|min:1',
+        'reviewer_ids.*' => 'required|exists:users,id',
+    ]);
+
+    $reviewRound = ReviewRound::findOrFail($roundId);
+    
+    // Verify the round belongs to this editor's paper
+    $paper = Paper::where('editorial_assigned', $request->user()->id)
+        ->where('id', $reviewRound->paper_id)
+        ->first();
+        
+    if (!$paper) {
+        return response()->json([
+            'message' => 'You are not authorized to manage this paper',
+        ], 403);
+    }
+
+    $assignedReviewers = [];
+    $dueDate = $request->due_date ?? now()->addDays(21);
+
+    foreach ($request->reviewer_ids as $reviewerId) {
+        // Check if already assigned to this round
+        $exists = Review::where('review_round_id', $roundId)
+            ->where('reviewer_id', $reviewerId)
+            ->exists();
+
+        if ($exists) {
+            continue;
+        }
+
+        // Check if reviewer is paper author
+        $isAuthor = $paper->authors()->where('user_id', $reviewerId)->exists();
+        if ($isAuthor) {
+            continue;
+        }
+
+        // Create the review assignment
+        $review = Review::create([
+            'review_round_id' => $roundId,
+            'reviewer_id' => $reviewerId,
+            'status' => 'pending',
+            'assigned_at' => now(),
+            'due_date' => $dueDate,
         ]);
 
-        $reviewRound = ReviewRound::findOrFail($roundId);
-        
-        // Check if round belongs to editor's paper
-        $paper = Paper::where('editorial_assigned', $request->user()->id)
-            ->where('id', $reviewRound->paper_id)
-            ->firstOrFail();
-
-        try {
-            DB::beginTransaction();
-
-            $assignedReviewers = [];
-            $dueDate = $request->due_date ?? now()->addDays(21);
-
-            foreach ($request->reviewer_ids as $reviewerId) {
-                // Check if already assigned
-                $exists = Review::where('review_round_id', $roundId)
-                    ->where('reviewer_id', $reviewerId)
-                    ->exists();
-
-                if ($exists) continue;
-
-                // Check if reviewer is paper author
-                $isAuthor = $paper->authors()->where('user_id', $reviewerId)->exists();
-                if ($isAuthor) continue;
-
-                $review = Review::create([
-                    'review_round_id' => $roundId,
-                    'reviewer_id' => $reviewerId,
-                    'status' => 'pending',
-                    'assigned_at' => now(),
-                    'due_date' => $dueDate,
-                ]);
-
-                // Update reviewer profile
-                $reviewerProfile = \App\Models\ReviewerProfile::where('user_id', $reviewerId)->first();
-                if ($reviewerProfile) {
-                    $reviewerProfile->incrementReviews();
-                }
-
-                // Send notification to reviewer
-                Notification::create([
-                    'user_id' => $reviewerId,
-                    'type' => 'review_invitation',
-                    'title' => 'Review Invitation',
-                    'message' => "You have been invited to review paper '{$paper->title}'",
-                    'data' => [
-                        'review_id' => $review->id,
-                        'paper_id' => $paper->id,
-                        'due_date' => $dueDate->toDateString(),
-                    ],
-                ]);
-
-                $assignedReviewers[] = $review;
+        // Update reviewer profile counter
+        $reviewerProfile = \App\Models\ReviewerProfile::where('user_id', $reviewerId)->first();
+        if ($reviewerProfile) {
+            $reviewerProfile->increment('current_reviews');
+            // Check if they're at max capacity
+            if ($reviewerProfile->fresh()->current_reviews >= $reviewerProfile->max_reviews) {
+                $reviewerProfile->update(['availability_status' => 'busy']);
             }
-
-            ActivityLog::create([
-                'user_id' => $request->user()->id,
-                'paper_id' => $paper->id,
-                'action' => 'reviewers_assigned',
-                'description' => count($assignedReviewers) . ' reviewers assigned',
-            ]);
-
-            DB::commit();
-
-            return response()->json([
-                'message' => 'Reviewers assigned successfully',
-                'assigned_reviewers' => $assignedReviewers,
-                'due_date' => $dueDate,
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'message' => 'Error assigning reviewers',
-                'error' => $e->getMessage(),
-            ], 500);
         }
+
+        // Send notification
+        Notification::create([
+            'user_id' => $reviewerId,
+            'type' => 'review_invitation',
+            'title' => 'Review Invitation',
+            'message' => "You have been invited to review paper '{$paper->title}'",
+            'data' => json_encode([
+                'review_id' => $review->id,
+                'paper_id' => $paper->id,
+                'due_date' => $dueDate->toDateString(),
+            ]),
+        ]);
+
+        $assignedReviewers[] = $review->load('reviewer');
     }
+
+    ActivityLog::create([
+        'user_id' => $request->user()->id,
+        'paper_id' => $paper->id,
+        'action' => 'reviewers_assigned',
+        'description' => count($assignedReviewers) . ' reviewer(s) assigned to round ' . $reviewRound->round_number,
+    ]);
+
+    return response()->json([
+        'message' => 'Reviewers assigned successfully',
+        'assigned_reviewers' => $assignedReviewers,
+    ]);
+}
 
     /**
      * Make editorial decision
