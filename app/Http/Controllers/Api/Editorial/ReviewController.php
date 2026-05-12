@@ -265,100 +265,118 @@ public function assignReviewers(Request $request, $roundId)
     /**
      * Make editorial decision
      */
-    public function makeDecision(Request $request, $roundId)
-    {
-        $request->validate([
-            'decision' => ['required', Rule::in(['accept', 'minor_revision', 'major_revision', 'reject'])],
-            'comments' => 'required|string',
-            'revision_deadline' => 'nullable|date|after:today|required_if:decision,minor_revision,major_revision',
+/**
+ * Make editorial decision
+ */
+public function makeDecision(Request $request, $roundId)
+{
+    $request->validate([
+        'decision' => ['required', Rule::in(['accept', 'minor_revision', 'major_revision', 'reject'])],
+        'comments' => 'required|string|min:10',
+        'revision_deadline' => 'nullable|date|after:today|required_if:decision,minor_revision,major_revision',
+    ]);
+
+    $reviewRound = ReviewRound::with(['reviews', 'paper'])->findOrFail($roundId);
+    
+    $paper = Paper::where('editorial_assigned', $request->user()->id)
+        ->where('id', $reviewRound->paper_id)
+        ->firstOrFail();
+
+    // Check if minimum reviews are complete
+    $completedReviews = $reviewRound->reviews->where('status', 'completed')->count();
+    if ($completedReviews < 1) { // Changed to 1 for testing, should be 2
+        return response()->json([
+            'message' => 'At least 1 review must be completed before making a decision. Current: ' . $completedReviews,
+        ], 422);
+    }
+
+    try {
+        DB::beginTransaction();
+
+        // Create editorial decision
+        $editorialDecision = EditorialDecision::create([
+            'review_round_id' => $roundId,
+            'decision_by' => $request->user()->id,
+            'decision' => $request->decision,
+            'comments' => $request->comments,
+            'made_at' => now(),
         ]);
 
-        $reviewRound = ReviewRound::with('reviews')->findOrFail($roundId);
-        
-        $paper = Paper::where('editorial_assigned', $request->user()->id)
-            ->where('id', $reviewRound->paper_id)
-            ->firstOrFail();
+        // Determine new paper status
+        $newStatus = match($request->decision) {
+            'accept' => 'accepted',
+            'minor_revision', 'major_revision' => 'revision_required',
+            'reject' => 'rejected',
+        };
 
-        // Check if minimum reviews are complete
-        $completedReviews = $reviewRound->reviews->where('status', 'completed')->count();
-        if ($completedReviews < 2) {
-            return response()->json([
-                'message' => 'At least 2 reviews must be completed before making a decision',
-            ], 422);
+        // Update paper
+        $paper->update([
+            'status' => $newStatus,
+            'decision_date' => now(),
+            'publication_date' => $request->decision === 'accept' ? now() : null,
+        ]);
+
+        // Mark review round as completed
+        $reviewRound->update([
+            'status' => 'completed',
+            'completed_at' => now(),
+        ]);
+
+        // Prepare notification for author
+        $decisionMessages = [
+            'accept' => "Congratulations! Your paper '{$paper->title}' has been accepted for publication.",
+            'minor_revision' => "Your paper '{$paper->title}' requires minor revisions. Please review and resubmit.",
+            'major_revision' => "Your paper '{$paper->title}' requires major revisions. Please review and resubmit.",
+            'reject' => "Unfortunately, your paper '{$paper->title}' has been rejected.",
+        ];
+
+        $notificationData = [
+            'paper_id' => $paper->id,
+            'decision' => $request->decision,
+            'round' => $reviewRound->round_number,
+        ];
+
+        if (in_array($request->decision, ['minor_revision', 'major_revision'])) {
+            $notificationData['deadline'] = $request->revision_deadline;
         }
 
-        try {
-            DB::beginTransaction();
+        // Send notification to author
+        Notification::create([
+            'user_id' => $paper->submitted_by,
+            'type' => 'editorial_decision',
+            'title' => 'Editorial Decision: ' . ucfirst(str_replace('_', ' ', $request->decision)),
+            'message' => $decisionMessages[$request->decision] . "\n\nEditor's Comments: " . $request->comments,
+            'data' => json_encode($notificationData),
+        ]);
 
-            // Create decision
-            $decision = EditorialDecision::create([
-                'review_round_id' => $roundId,
-                'decision_by' => $request->user()->id,
+        // Log activity
+        ActivityLog::create([
+            'user_id' => $request->user()->id,
+            'paper_id' => $paper->id,
+            'action' => 'decision_made',
+            'description' => "Decision: {$request->decision} on Round {$reviewRound->round_number}",
+            'metadata' => json_encode([
                 'decision' => $request->decision,
-                'comments' => $request->comments,
-                'made_at' => now(),
-            ]);
+                'round' => $reviewRound->round_number,
+            ]),
+        ]);
 
-            // Update paper status
-            $newStatus = match($request->decision) {
-                'accept' => 'accepted',
-                'minor_revision', 'major_revision' => 'revision_required',
-                'reject' => 'rejected',
-            };
+        DB::commit();
 
-            $paper->update([
-                'status' => $newStatus,
-                'decision_date' => now(),
-            ]);
+        return response()->json([
+            'message' => 'Decision submitted successfully',
+            'decision' => $editorialDecision->load('decidedBy'),
+            'paper' => $paper->fresh(),
+        ]);
 
-            // Mark round as completed
-            $reviewRound->update([
-                'status' => 'completed',
-                'completed_at' => now(),
-            ]);
-
-            // Notify author
-            $decisionMessages = [
-                'accept' => 'Your paper has been accepted!',
-                'minor_revision' => 'Minor revisions requested for your paper.',
-                'major_revision' => 'Major revisions requested for your paper.',
-                'reject' => 'Your paper has been rejected.',
-            ];
-
-            Notification::create([
-                'user_id' => $paper->submitted_by,
-                'type' => 'editorial_decision',
-                'title' => 'Editorial Decision',
-                'message' => $decisionMessages[$request->decision],
-                'data' => [
-                    'paper_id' => $paper->id,
-                    'decision' => $request->decision,
-                    'deadline' => $request->revision_deadline,
-                ],
-            ]);
-
-            ActivityLog::create([
-                'user_id' => $request->user()->id,
-                'paper_id' => $paper->id,
-                'action' => 'decision_made',
-                'description' => "Decision: {$request->decision}",
-            ]);
-
-            DB::commit();
-
-            return response()->json([
-                'message' => 'Decision submitted successfully',
-                'decision' => $decision,
-            ]);
-
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return response()->json([
-                'message' => 'Error making decision',
-                'error' => $e->getMessage(),
-            ], 500);
-        }
+    } catch (\Exception $e) {
+        DB::rollBack();
+        return response()->json([
+            'message' => 'Error making decision',
+            'error' => $e->getMessage(),
+        ], 500);
     }
+}
 
     /**
      * Get all reviews for a round

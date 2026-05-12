@@ -37,16 +37,19 @@ Route::middleware('auth:sanctum')->group(function () {
     |--------------------------------------------------------------------------
     */
     Route::middleware(['role:author'])->prefix('author')->group(function () {
-        Route::get('/dashboard', function () {
-            return response()->json([
-                'message' => 'Author Dashboard',
-                'stats' => [
-                    'total_papers' => \App\Models\Paper::where('submitted_by', request()->user()->id)->count(),
-                    'under_review' => \App\Models\Paper::where('submitted_by', request()->user()->id)->where('status', 'under_review')->count(),
-                    'accepted' => \App\Models\Paper::where('submitted_by', request()->user()->id)->where('status', 'accepted')->count(),
-                ]
-            ]);
-        });
+Route::get('/dashboard', function () {
+    $user = request()->user();
+    return response()->json([
+        'message' => 'Author Dashboard',
+        'stats' => [
+            'total_papers' => \App\Models\Paper::where('submitted_by', $user->id)->count(),
+            'under_review' => \App\Models\Paper::where('submitted_by', $user->id)->whereIn('status', ['submitted', 'under_review'])->count(),
+            'accepted' => \App\Models\Paper::where('submitted_by', $user->id)->where('status', 'accepted')->count(),
+            'revision_required' => \App\Models\Paper::where('submitted_by', $user->id)->where('status', 'revision_required')->count(),
+            'rejected' => \App\Models\Paper::where('submitted_by', $user->id)->where('status', 'rejected')->count(),
+        ]
+    ]);
+});
         
         Route::get('/categories', [PaperController::class, 'categories']);
         Route::get('/papers', [PaperController::class, 'index']);
