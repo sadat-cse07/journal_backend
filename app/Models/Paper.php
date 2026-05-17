@@ -25,6 +25,8 @@ class Paper extends Model
         'submission_date',
         'decision_date',
         'publication_date',
+        'desk_reject_reason',
+        'desk_reject_comments',
     ];
 
     protected $casts = [
@@ -38,10 +40,10 @@ class Paper extends Model
     protected static function boot()
     {
         parent::boot();
-        
+
         static::creating(function ($paper) {
             if (empty($paper->uuid)) {
-                $paper->uuid = (string) Str::uuid();
+                $paper->uuid = (string)Str::uuid();
             }
         });
     }
@@ -80,7 +82,7 @@ class Paper extends Model
     public function currentReviewRound()
     {
         return $this->hasOne(ReviewRound::class)
-                    ->where('round_number', $this->current_round);
+            ->where('round_number', $this->current_round);
     }
 
     public function activityLogs()
